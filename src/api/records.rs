@@ -37,9 +37,15 @@ struct ParticipantFiles {
 #[derive(Clone, Deserialize)]
 struct TrackMetadata {
     participant_id: String,
-    source_name: Option<String>,
+    participant_name: Option<String>,
     source_type: Option<String>,
     first_buffer_session_offset_ns: u64,
+}
+
+#[derive(Deserialize)]
+struct ParticipantName {
+    participant_id: String,
+    display_name: String,
 }
 
 impl TrackMetadata {
@@ -267,7 +273,9 @@ async fn participants(
     id: Uuid,
 ) -> Result<Vec<(String, ParticipantFiles)>, String> {
     let dir = PathBuf::from(state.recordings_dir.as_ref()).join(id.to_string());
-    let mut files = fs::read_dir(dir).await.map_err(|error| error.to_string())?;
+    let mut files = fs::read_dir(&dir)
+        .await
+        .map_err(|error| error.to_string())?;
     let mut participants = HashMap::<String, ParticipantFiles>::new();
     while let Some(file) = files
         .next_entry()
@@ -302,6 +310,30 @@ async fn participants(
                 .await
                 .ok()
                 .and_then(|value| serde_json::from_str(&value).ok());
+        }
+    }
+    for entry in participants.values_mut() {
+        let id = entry
+            .video_meta
+            .as_ref()
+            .or(entry.audio_meta.as_ref())
+            .map(|meta| meta.participant_id.clone());
+        let Some(id) = id.filter(|id| safe_participant(id)) else {
+            continue;
+        };
+        let name = fs::read_to_string(dir.join(format!("participant-{id}.json")))
+            .await
+            .ok()
+            .and_then(|value| serde_json::from_str::<ParticipantName>(&value).ok())
+            .filter(|info| info.participant_id == id && !info.display_name.trim().is_empty())
+            .map(|info| info.display_name);
+        if let Some(name) = name {
+            if let Some(meta) = entry.video_meta.as_mut() {
+                meta.participant_name = Some(name.clone());
+            }
+            if let Some(meta) = entry.audio_meta.as_mut() {
+                meta.participant_name = Some(name);
+            }
         }
     }
     let mut participants: Vec<_> = participants.into_iter().collect();
@@ -358,19 +390,21 @@ async fn page(state: &AppState, selected: Option<Uuid>) -> Response {
                 .as_ref()
                 .or(files.audio_meta.as_ref())
                 .map(|meta| {
+                    let name = meta
+                        .participant_name
+                        .as_deref()
+                        .filter(|name| !name.trim().is_empty())
+                        .map(|name| name.chars().take(128).collect::<String>())
+                        .unwrap_or_else(|| format!("Участник {}", meta.participant_id));
                     format!(
-                        "Участник {} · {}{}",
-                        escape(&meta.participant_id),
+                        "{} · {}",
+                        escape(&name),
                         match meta.source_type.as_deref() {
                             Some("desktop") => "Экран",
                             Some("camera") => "Камера",
                             _ if files.audio.is_some() => "Звук",
                             _ => "Источник",
-                        },
-                        meta.source_name
-                            .as_ref()
-                            .map(|name| format!(" ({})", escape(name)))
-                            .unwrap_or_default()
+                        }
                     )
                 })
                 .unwrap_or_else(|| format!("Участник {safe_id}"));

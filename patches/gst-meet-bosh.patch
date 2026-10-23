@@ -3694,7 +3694,7 @@ index 9a2ed7f..828971a 100644
  tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = [
    "fmt",
 diff --git a/lib-gst-meet/src/conference.rs b/lib-gst-meet/src/conference.rs
-index 83f095b..768e4e3 100644
+index 83f095b..5dc9213 100644
 --- a/lib-gst-meet/src/conference.rs
 +++ b/lib-gst-meet/src/conference.rs
 @@ -91,6 +91,10 @@ pub struct JitsiConferenceConfig {
@@ -3725,8 +3725,43 @@ index 83f095b..768e4e3 100644
        debug!("setting pipeline state to NULL");
        if let Err(e) = jingle_session.pipeline().set_state(gstreamer::State::Null) {
          warn!("failed to set pipeline state to NULL: {:?}", e);
+@@ -467,6 +476,11 @@ impl JitsiConference {
+     Ok(())
+   }
+ 
++  pub(crate) async fn participant_nick(&self, id: &str) -> Option<String> {
++    let id = jid::ResourcePart::new(id).ok()?;
++    self.inner.lock().await.participants.get(&id).and_then(|participant| participant.nick.clone())
++  }
++
+   #[tracing::instrument(level = "trace", skip(f))]
+   pub async fn on_participant(
+     &self,
+@@ -986,6 +1000,22 @@ impl StanzaFilter for JitsiConference {
+                         .nick
+                         .or_else(|| nick_payload.as_ref().map(|nick| nick.0.clone())),
+                     };
++                    if presence.type_ != presence::Type::Unavailable {
++                      if let (Some(dir), Some(name)) = (&self.config.recording_metadata_dir, &participant.nick) {
++                        let id = from.resource_str();
++                        if id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) {
++                          let path = format!("{}/participant-{}.json", dir, id);
++                          let metadata = serde_json::json!({
++                            "schema_version": 1,
++                            "participant_id": id,
++                            "display_name": name,
++                          });
++                          if let Err(error) = std::fs::write(&path, metadata.to_string()) {
++                            warn!("failed to save participant name {}: {}", path, error);
++                          }
++                        }
++                      }
++                    }
+                     if presence.type_ == presence::Type::Unavailable
+                       && self
+                         .inner
 diff --git a/lib-gst-meet/src/jingle.rs b/lib-gst-meet/src/jingle.rs
-index 58db4ff..cd59d81 100644
+index 58db4ff..31f28fc 100644
 --- a/lib-gst-meet/src/jingle.rs
 +++ b/lib-gst-meet/src/jingle.rs
 @@ -1,4 +1,4 @@
@@ -3810,7 +3845,7 @@ index 58db4ff..cd59d81 100644
              {
                debug!("nothing to link to decoder, adding fakesink");
                let fakesink = gstreamer::ElementFactory::make("fakesink").build()?;
-@@ -1059,7 +1081,54 @@ impl JingleSession {
+@@ -1059,7 +1081,56 @@ impl JingleSession {
                },
              };
  
@@ -3818,6 +3853,7 @@ index 58db4ff..cd59d81 100644
 +            if let Some(template) = source_template {
 +              let source_name = source.name.as_deref().unwrap_or("unknown");
 +              let track_id = format!("{}-{}-{}", safe_track_component(&participant_id), safe_track_component(source_name), ssrc);
++              let participant_name = handle.block_on(conference.participant_nick(&participant_id));
 +              let media_kind = match source.media_type { MediaType::Audio => "audio", MediaType::Video => "video" };
 +              let description = template.replace("{track_id}", &track_id).replace("{participant_id}", &safe_track_component(&participant_id));
 +              let bin = gstreamer::parse::bin_from_description(&description, false)
@@ -3843,6 +3879,7 @@ index 58db4ff..cd59d81 100644
 +                  let metadata = serde_json::json!({
 +                    "schema_version": 1,
 +                    "participant_id": participant_id,
++                    "participant_name": participant_name,
 +                    "source_name": source_name,
 +                    "source_type": video_type,
 +                    "media_type": media_kind,
@@ -3866,7 +3903,7 @@ index 58db4ff..cd59d81 100644
                let sink_pad = sink_element
                  .request_pad_simple("sink_%u")
                  .context("no suitable sink pad provided by sink element in recv pipeline")?;
-@@ -1313,10 +1382,15 @@ impl JingleSession {
+@@ -1313,10 +1384,15 @@ impl JingleSession {
      let bus = pipeline.bus().context("failed to get pipeline bus")?;
  
      let (pipeline_state_null_tx, pipeline_state_null_rx) = oneshot::channel();
@@ -3882,7 +3919,7 @@ index 58db4ff..cd59d81 100644
            gstreamer::MessageView::Error(e) => {
              if let Some(d) = e.debug() {
                error!("{}", d);
-@@ -1532,6 +1606,7 @@ impl JingleSession {
+@@ -1532,6 +1608,7 @@ impl JingleSession {
        colibri_channel: None,
        stats_handler_task: None,
        pipeline_state_null_rx,
@@ -3890,7 +3927,7 @@ index 58db4ff..cd59d81 100644
      })
    }
  
-@@ -1552,6 +1627,8 @@ impl JingleSession {
+@@ -1552,6 +1629,8 @@ impl JingleSession {
              Source {
                ssrc: ssrc.id,
                participant_id: participant_id_for_owner(owner)?,
