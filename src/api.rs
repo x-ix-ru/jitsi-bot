@@ -1,5 +1,10 @@
 use std::{
-    collections::HashMap, env, fs, path::PathBuf, process::Stdio, sync::Arc, time::Duration,
+    collections::HashMap,
+    env, fs,
+    path::PathBuf,
+    process::Stdio,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -19,6 +24,8 @@ use uuid::Uuid;
 
 use crate::{encode_room, recording_pipeline, video_bitrate};
 
+mod records;
+
 #[derive(Clone)]
 struct AppState {
     token: Arc<str>,
@@ -29,6 +36,7 @@ struct AppState {
     gst_meet_bin: Arc<str>,
     video_bitrate: u32,
     sessions: Arc<Mutex<HashMap<Uuid, SessionEntry>>>,
+    web_sessions: Arc<Mutex<HashMap<Uuid, Instant>>>,
 }
 
 struct SessionEntry {
@@ -132,6 +140,12 @@ async fn join(
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("cannot create recording directory: {error}"),
+        )
+    })?;
+    fs::write(format!("{dir}/room.txt"), &room).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot save session metadata: {error}"),
         )
     })?;
     let pipeline = recording_pipeline(&dir, state.video_bitrate);
@@ -315,6 +329,7 @@ pub(crate) async fn serve() -> Result<(), String> {
             .into(),
         video_bitrate: video_bitrate()?,
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        web_sessions: Arc::new(Mutex::new(HashMap::new())),
     };
     let bind = env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -324,6 +339,16 @@ pub(crate) async fn serve() -> Result<(), String> {
         .route("/api/jitsi-bot/join", post(join))
         .route("/api/jitsi-bot/sessions/{id}", get(session))
         .route("/api/jitsi-bot/sessions/{id}/leave", post(leave))
+        .route("/records", get(records::index))
+        .route(
+            "/records/login",
+            get(records::login_page).post(records::login),
+        )
+        .route("/records/{id}", get(records::show))
+        .route(
+            "/records/{id}/media/{participant}/{kind}",
+            get(records::media),
+        )
         .with_state(state.clone());
     eprintln!("Jitsi bot API listening on {bind}");
     axum::serve(listener, app)
