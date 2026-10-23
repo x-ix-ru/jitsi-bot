@@ -9,6 +9,55 @@ Node.js и браузер внутри контейнера не использ�
 Сервис запускает отдельный Rust-бинарник `gst-meet`, использующий `lib-gst-meet`;
 библиотека пока не встроена напрямую в процесс сервиса.
 
+## HTTP API
+
+Сборка и запуск сервиса:
+
+```sh
+docker build -f Dockerfile.bosh -t hermes-jitsi-bosh .
+cp .env.api.example .env.api
+printf 'API_TOKEN=%s\n' "$(openssl rand -hex 24)" >> .env.api
+mkdir -p recordings
+docker run --rm --init --env-file .env.api \
+  -p 127.0.0.1:8080:8080 \
+  -v "$PWD/recordings:/data/recordings" hermes-jitsi-bosh
+```
+
+Пример вызова из другого терминала (токен взять из `.env.api`):
+
+```sh
+TOKEN=$(awk -F= '/^API_TOKEN=/{print $2}' .env.api)
+curl -sS -X POST http://127.0.0.1:8080/api/jitsi-bot/join \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"room":"комната"}'
+```
+
+Ответ `202 Accepted`:
+
+```json
+{"session_id":"550e8400-e29b-41d4-a716-446655440000","room":"комната","status":"starting","recording_dir":"/data/recordings/550e8400-e29b-41d4-a716-446655440000","exit_code":null}
+```
+
+ID выше приведён для примера. `starting` означает, что процесс запущен, но
+вход в комнату ещё не подтверждён. Когда установлено медиасоединение, состояние
+становится `joined`. Если процесс завершился, состояние будет `exited`.
+
+```sh
+SESSION_ID=550e8400-e29b-41d4-a716-446655440000 # замените ID из ответа join
+curl -sS http://127.0.0.1:8080/api/jitsi-bot/sessions/$SESSION_ID \
+  -H "Authorization: Bearer $TOKEN"
+curl -sS -X POST http://127.0.0.1:8080/api/jitsi-bot/sessions/$SESSION_ID/leave \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Для `join` можно передать `{}`: тогда используются `JITSI_ROOM` и `JITSI_NICK`
+из конфигурации. Каждый вызов создаёт отдельный процесс и каталог записи с
+ID сессии. Максимум — 10 активных сессий. Состояния сессий хранятся в памяти
+и исчезают после перезапуска сервиса; записи остаются в каталоге. API требует
+секретный `API_TOKEN` (не менее 16 байт). В примере порт доступен только с
+машины, где запущен Docker.
+
 ## Запись комнаты «комната»
 
 ```sh

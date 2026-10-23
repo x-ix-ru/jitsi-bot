@@ -2,7 +2,12 @@
 name = "hermes-jitsi-bridge"
 version = "0.1.0"
 edition = "2021"
-description = "Headless Jitsi transport probe and per-participant recorder"
+description = "Headless Jitsi recorder with a session API"
 license = "MIT"
 
 [dependencies]
+axum = "0.8.9"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1.53", features = ["full"] }
+uuid = { version = "1.28", features = ["v4", "serde"] }

@@ -24,6 +24,7 @@ RUN useradd --uid 10001 --create-home bridge && mkdir -p /data/recordings \
     && chown bridge:bridge /data/recordings
 USER bridge
 ENV RECORDINGS_DIR=/data/recordings
+EXPOSE 8080
 STOPSIGNAL SIGINT
 ENTRYPOINT ["/usr/local/bin/hermes-jitsi-bridge"]
-CMD ["record"]
+CMD ["serve"]

@@ -5,6 +5,8 @@ use std::{
     process::{Command, ExitCode, Stdio},
 };
 
+mod api;
+
 const REQUIRED_PLUGINS: &[&str] = &[
     "audiotestsrc",
     "audioconvert",
@@ -139,11 +141,23 @@ fn check_compatibility() -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    if env::args().nth(1).as_deref() == Some("serve") {
+        return match tokio::runtime::Runtime::new()
+            .map_err(|error| error.to_string())
+            .and_then(|runtime| runtime.block_on(api::serve()))
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let result = match env::args().nth(1).as_deref() {
         Some("check") => check_compatibility(),
         Some("record") => record(),
         Some("run") | None => run(),
-        _ => Err("usage: hermes-jitsi-bridge [check|run|record]".into()),
+        _ => Err("usage: hermes-jitsi-bridge [check|run|record|serve]".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -175,10 +189,7 @@ fn record() -> Result<(), String> {
     }
     fs::create_dir_all(&output_dir)
         .map_err(|e| format!("cannot create recordings directory: {e}"))?;
-    let pipeline = format!(
-        "audioconvert name=audio ! audioresample ! opusenc ! webmmux streamable=true ! filesink location={output_dir}/{{participant_id}}-audio.webm \
-         videoconvert name=video ! vp8enc deadline=1 ! webmmux streamable=true ! filesink location={output_dir}/{{participant_id}}-video.webm"
-    );
+    let pipeline = recording_pipeline(&output_dir);
     println!("Recording room {room} (XMPP name {encoded_room}) to {output_dir}");
     let error = Command::new("gst-meet")
         .arg(format!("--bosh-url={bosh_url}"))
@@ -192,7 +203,14 @@ fn record() -> Result<(), String> {
     Err(format!("cannot start gst-meet BOSH recorder: {error}"))
 }
 
-fn encode_room(room: &str) -> String {
+pub(crate) fn recording_pipeline(output_dir: &str) -> String {
+    format!(
+        "audioconvert name=audio ! audioresample ! opusenc ! webmmux streamable=true ! filesink location={output_dir}/{{participant_id}}-audio.webm \
+         videoconvert name=video ! vp8enc deadline=1 ! webmmux streamable=true ! filesink location={output_dir}/{{participant_id}}-video.webm"
+    )
+}
+
+pub(crate) fn encode_room(room: &str) -> String {
     let mut encoded = String::new();
     for byte in room.bytes() {
         if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {

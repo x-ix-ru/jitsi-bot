@@ -2,5 +2,6 @@ target
 audio
 .env
 .env.record
+.env.api
 .git
 recordings
