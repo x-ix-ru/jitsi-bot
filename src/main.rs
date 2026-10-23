@@ -189,7 +189,7 @@ fn record() -> Result<(), String> {
     }
     fs::create_dir_all(&output_dir)
         .map_err(|e| format!("cannot create recordings directory: {e}"))?;
-    let pipeline = recording_pipeline(&output_dir);
+    let pipeline = recording_pipeline(&output_dir, video_bitrate()?);
     println!("Recording room {room} (XMPP name {encoded_room}) to {output_dir}");
     let error = Command::new("gst-meet")
         .arg(format!("--bosh-url={bosh_url}"))
@@ -203,10 +203,21 @@ fn record() -> Result<(), String> {
     Err(format!("cannot start gst-meet BOSH recorder: {error}"))
 }
 
-pub(crate) fn recording_pipeline(output_dir: &str) -> String {
+pub(crate) fn video_bitrate() -> Result<u32, String> {
+    let kbps = env::var("VIDEO_BITRATE_KBPS")
+        .unwrap_or_else(|_| "3000".into())
+        .parse::<u32>()
+        .map_err(|_| "VIDEO_BITRATE_KBPS must be an integer")?;
+    if !(250..=20_000).contains(&kbps) {
+        return Err("VIDEO_BITRATE_KBPS must be between 250 and 20000".into());
+    }
+    Ok(kbps * 1000)
+}
+
+pub(crate) fn recording_pipeline(output_dir: &str, video_bitrate: u32) -> String {
     format!(
         "audioconvert name=audio ! audioresample ! opusenc ! webmmux streamable=true ! filesink location={output_dir}/{{participant_id}}-audio.webm \
-         videoconvert name=video ! vp8enc deadline=1 ! webmmux streamable=true ! filesink location={output_dir}/{{participant_id}}-video.webm"
+         videoconvert name=video ! vp8enc target-bitrate={video_bitrate} deadline=1000000 cpu-used=4 threads=4 ! webmmux streamable=true ! filesink location={output_dir}/{{participant_id}}-video.webm"
     )
 }
 

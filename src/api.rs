@@ -17,7 +17,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::{encode_room, recording_pipeline};
+use crate::{encode_room, recording_pipeline, video_bitrate};
 
 #[derive(Clone)]
 struct AppState {
@@ -27,6 +27,7 @@ struct AppState {
     default_nick: Arc<str>,
     recordings_dir: Arc<str>,
     gst_meet_bin: Arc<str>,
+    video_bitrate: u32,
     sessions: Arc<Mutex<HashMap<Uuid, SessionEntry>>>,
 }
 
@@ -133,7 +134,7 @@ async fn join(
             format!("cannot create recording directory: {error}"),
         )
     })?;
-    let pipeline = recording_pipeline(&dir);
+    let pipeline = recording_pipeline(&dir, state.video_bitrate);
     let mut command = Command::new(&*state.gst_meet_bin);
     command
         .arg(format!("--bosh-url={}", state.bosh_url))
@@ -312,6 +313,7 @@ pub(crate) async fn serve() -> Result<(), String> {
         gst_meet_bin: env::var("GST_MEET_BIN")
             .unwrap_or_else(|_| "gst-meet".into())
             .into(),
+        video_bitrate: video_bitrate()?,
         sessions: Arc::new(Mutex::new(HashMap::new())),
     };
     let bind = env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
