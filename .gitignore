@@ -1,0 +1,5 @@
+/target
+/audio
+/.env
+/.env.record
+/recordings

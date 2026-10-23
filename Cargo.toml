@@ -1,0 +1,8 @@
+[package]
+name = "hermes-jitsi-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Headless Jitsi transport probe and per-participant recorder"
+license = "MIT"
+
+[dependencies]
