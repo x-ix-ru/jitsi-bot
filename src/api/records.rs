@@ -30,6 +30,22 @@ struct RecordRow {
 struct ParticipantFiles {
     audio: Option<u64>,
     video: Option<u64>,
+    audio_meta: Option<TrackMetadata>,
+    video_meta: Option<TrackMetadata>,
+}
+
+#[derive(Clone, Deserialize)]
+struct TrackMetadata {
+    participant_id: String,
+    source_name: Option<String>,
+    source_type: Option<String>,
+    first_buffer_session_offset_ns: u64,
+}
+
+impl TrackMetadata {
+    fn offset_secs(&self) -> f64 {
+        self.first_buffer_session_offset_ns as f64 / 1_000_000_000.0
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -276,8 +292,16 @@ async fn participants(
         let entry = participants.entry(participant.to_string()).or_default();
         if kind == "video" {
             entry.video = Some(size);
+            entry.video_meta = fs::read_to_string(file.path().with_extension("track.json"))
+                .await
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok());
         } else {
             entry.audio = Some(size);
+            entry.audio_meta = fs::read_to_string(file.path().with_extension("track.json"))
+                .await
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok());
         }
     }
     let mut participants: Vec<_> = participants.into_iter().collect();
@@ -329,29 +353,67 @@ async fn page(state: &AppState, selected: Option<Uuid>) -> Response {
         let mut cards = String::new();
         for (participant, files) in files {
             let safe_id = escape(&participant);
+            let label = files
+                .video_meta
+                .as_ref()
+                .or(files.audio_meta.as_ref())
+                .map(|meta| {
+                    format!(
+                        "Участник {} · {}{}",
+                        escape(&meta.participant_id),
+                        match meta.source_type.as_deref() {
+                            Some("desktop") => "Экран",
+                            Some("camera") => "Камера",
+                            _ if files.audio.is_some() => "Звук",
+                            _ => "Источник",
+                        },
+                        meta.source_name
+                            .as_ref()
+                            .map(|name| format!(" ({})", escape(name)))
+                            .unwrap_or_default()
+                    )
+                })
+                .unwrap_or_else(|| format!("Участник {safe_id}"));
+            let video_offset = files
+                .video_meta
+                .as_ref()
+                .map_or(0.0, TrackMetadata::offset_secs);
+            let audio_offset = files
+                .audio_meta
+                .as_ref()
+                .map_or(0.0, TrackMetadata::offset_secs);
             let video = match files.video {
                 Some(size) if size > 0 => format!(
-                    "<video controls preload=\"metadata\" playsinline src=\"/records/{id}/media/{safe_id}/video\"></video><a class=\"download\" href=\"/records/{id}/media/{safe_id}/video\" download>Скачать видео · {}</a>",
+                    "<video controls preload=\"metadata\" playsinline data-offset=\"{video_offset}\" src=\"/records/{id}/media/{safe_id}/video\"></video><a class=\"download\" href=\"/records/{id}/media/{safe_id}/video\" download>Скачать видео · {}</a>",
                     file_size(size)
                 ),
+                _ if files.audio_meta.is_some() => String::new(),
                 _ => "<p class=\"hint\">Видеопоток не записан.</p>".into(),
             };
             let audio = match files.audio {
                 Some(size) if size > 0 => format!(
-                    "<audio controls preload=\"metadata\" src=\"/records/{id}/media/{safe_id}/audio\"></audio><a class=\"download\" href=\"/records/{id}/media/{safe_id}/audio\" download>Скачать аудио · {}</a>",
+                    "<audio controls preload=\"metadata\" data-offset=\"{audio_offset}\" src=\"/records/{id}/media/{safe_id}/audio\"></audio><a class=\"download\" href=\"/records/{id}/media/{safe_id}/audio\" download>Скачать аудио · {}</a>",
                     file_size(size)
                 ),
+                _ if files.video_meta.is_some() => String::new(),
                 _ => "<p class=\"hint\">Аудиопоток не записан.</p>".into(),
             };
+            let mut starts = Vec::new();
+            if files.video.is_some() {
+                starts.push(format!("Видео: +{video_offset:.3} с"));
+            }
+            if files.audio.is_some() {
+                starts.push(format!("Звук: +{audio_offset:.3} с"));
+            }
             cards.push_str(&format!(
-                "<section class=\"card\"><h2>Участник {safe_id}</h2>{video}{audio}</section>"
+                "<section class=\"card\"><h2>{label}</h2><p class=\"hint\">{}</p>{video}{audio}</section>", starts.join(" · ")
             ));
         }
         if cards.is_empty() {
             cards.push_str("<section class=\"card\"><p>Файлов пока нет. Записи появятся, когда участник включит камеру или микрофон.</p></section>");
         }
         format!(
-            "<div class=\"eyebrow\">Сессия {id}</div><h1>{room}</h1><div class=\"badge\">{status}</div><p class=\"hint\">Видео и аудио сохраняются отдельно для каждого участника. Для обновления списка файлов перезагрузите страницу.</p>{cards}",
+            "<div class=\"eyebrow\">Сессия {id}</div><h1>{room}</h1><div class=\"badge\">{status}</div><p class=\"hint\">Каждая дорожка имеет начало на общей шкале встречи. Камера, экран и звук отображаются отдельно.</p><div class=\"sync\"><button type=\"button\" id=\"play-all\">▶ Воспроизвести все</button><button type=\"button\" id=\"pause-all\">Пауза</button><input id=\"timeline\" type=\"range\" min=\"0\" max=\"1\" step=\"0.01\" value=\"0\" aria-label=\"Время встречи\"><span id=\"time-label\">0:00</span></div>{cards}",
             room = escape(row.room.trim()),
             status = status_label(row.status),
         )
@@ -360,8 +422,25 @@ async fn page(state: &AppState, selected: Option<Uuid>) -> Response {
     };
     let html = format!(
         r#"<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Записи Jitsi</title><style>
-*{{box-sizing:border-box}}body{{margin:0;background:#0b1220;color:#eaf0fa;font:16px/1.5 system-ui,-apple-system,sans-serif}}a{{color:inherit}}.layout{{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}}aside{{background:#111c2e;border-right:1px solid #26364b;padding:28px 18px}}aside header{{display:flex;align-items:center;justify-content:space-between;padding:0 10px 22px}}aside header a{{color:#8fc6ff;font-size:13px;text-decoration:none}}aside h2{{font-size:18px;margin:0}}.session{{display:block;padding:14px 15px;margin:5px 0;border-radius:12px;text-decoration:none;color:#d5dfec}}.session:hover,.selected{{background:#203149}}.session strong{{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.session small{{display:block;color:#96a9bf;margin-top:3px}}main{{max-width:1100px;width:100%;margin:0 auto;padding:46px 42px}}h1{{font-size:32px;margin:5px 0 12px}}.eyebrow{{font-size:13px;color:#8fb6d9;word-break:break-all}}.badge{{display:inline-block;background:#173c3a;color:#a4edce;border-radius:999px;padding:5px 12px;font-size:13px;margin-bottom:16px}}.hint,.empty{{color:#a9bad0}}.card{{background:#172438;border:1px solid #2b3d55;border-radius:16px;padding:24px;margin-top:22px}}.card h2{{font-size:19px;margin:0 0 16px}}video{{display:block;width:100%;max-height:70vh;background:#080d15;border-radius:10px}}audio{{display:block;width:100%;margin-top:18px}}.download{{display:inline-block;color:#9bd0ff;font-size:14px;margin-top:8px}}@media(max-width:760px){{.layout{{grid-template-columns:1fr}}aside{{border-right:0;border-bottom:1px solid #26364b;padding:16px}}aside header{{padding:0 5px 8px}}main{{padding:25px 18px}}.session{{display:inline-block;min-width:170px;max-width:240px}}}}
-</style></head><body><div class="layout"><aside><header><h2><a href="/records">Записи</a></h2><a href="">Обновить ↻</a></header>{nav}</aside><main>{content}</main></div></body></html>"#
+*{{box-sizing:border-box}}body{{margin:0;background:#0b1220;color:#eaf0fa;font:16px/1.5 system-ui,-apple-system,sans-serif}}a{{color:inherit}}.layout{{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}}aside{{background:#111c2e;border-right:1px solid #26364b;padding:28px 18px}}aside header{{display:flex;align-items:center;justify-content:space-between;padding:0 10px 22px}}aside header a{{color:#8fc6ff;font-size:13px;text-decoration:none}}aside h2{{font-size:18px;margin:0}}.session{{display:block;padding:14px 15px;margin:5px 0;border-radius:12px;text-decoration:none;color:#d5dfec}}.session:hover,.selected{{background:#203149}}.session strong{{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.session small{{display:block;color:#96a9bf;margin-top:3px}}main{{max-width:1100px;width:100%;margin:0 auto;padding:46px 42px}}h1{{font-size:32px;margin:5px 0 12px}}.eyebrow{{font-size:13px;color:#8fb6d9;word-break:break-all}}.badge{{display:inline-block;background:#173c3a;color:#a4edce;border-radius:999px;padding:5px 12px;font-size:13px;margin-bottom:16px}}.hint,.empty{{color:#a9bad0}}.sync{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:14px;background:#172438;border-radius:12px}}.sync button{{background:#7bbaf2;color:#071120;border:0;border-radius:8px;padding:8px 12px;cursor:pointer}}.sync input{{flex:1;min-width:150px}}.card{{background:#172438;border:1px solid #2b3d55;border-radius:16px;padding:24px;margin-top:22px}}.card h2{{font-size:19px;margin:0 0 16px}}video{{display:block;width:100%;max-height:70vh;background:#080d15;border-radius:10px}}audio{{display:block;width:100%;margin-top:18px}}.download{{display:inline-block;color:#9bd0ff;font-size:14px;margin-top:8px}}@media(max-width:760px){{.layout{{grid-template-columns:1fr}}aside{{border-right:0;border-bottom:1px solid #26364b;padding:16px}}aside header{{padding:0 5px 8px}}main{{padding:25px 18px}}.session{{display:inline-block;min-width:170px;max-width:240px}}}}
+</style></head><body><div class="layout"><aside><header><h2><a href="/records">Записи</a></h2><a href="">Обновить ↻</a></header>{nav}</aside><main>{content}</main></div><script>
+(() => {{ const slider=document.getElementById('timeline'); if(!slider)return;
+const media=[...document.querySelectorAll('video[data-offset],audio[data-offset]')];
+const label=document.getElementById('time-label'); let playing=false, at=0, last=performance.now();
+const fmt=t=>`${{Math.floor(t/60)}}:${{String(Math.floor(t%60)).padStart(2,'0')}}`;
+function sync(force=false){{ const now=performance.now(); if(playing)at+=(now-last)/1000; last=now;
+let end=0; for(const item of media){{ const offset=Number(item.dataset.offset)||0;
+if(Number.isFinite(item.duration))end=Math.max(end,offset+item.duration);
+if(!playing&&!force)continue;
+const target=at-offset; if(target<0 || (Number.isFinite(item.duration)&&target>=item.duration)){{item.pause();continue;}}
+if(Math.abs(item.currentTime-target)>0.25){{try{{item.currentTime=Math.max(0,target)}}catch(_){{}}}}
+if(playing&&item.paused)item.play().catch(()=>{{}}); if(!playing&&!item.paused)item.pause();}}
+slider.max=String(Math.max(1,end)); if(at>end&&end>0){{at=end;playing=false;}} slider.value=String(at);label.textContent=fmt(at);}}
+document.getElementById('play-all').onclick=()=>{{playing=true;last=performance.now();sync();}};
+document.getElementById('pause-all').onclick=()=>{{playing=false;media.forEach(item=>item.pause());sync();}};
+slider.oninput=()=>{{at=Number(slider.value);last=performance.now();sync(true);}};
+setInterval(sync,100); media.forEach(item=>item.addEventListener('loadedmetadata',sync)); sync();
+}})();</script></body></html>"#
     );
     ([(header::CACHE_CONTROL, "no-store")], Html(html)).into_response()
 }

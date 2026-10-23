@@ -3519,7 +3519,7 @@ index 342410b..f2e97f6 100644
 +source = "registry+https://github.com/rust-lang/crates.io-index"
 +checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 diff --git a/gst-meet/src/main.rs b/gst-meet/src/main.rs
-index 08c2cc9..1c19a6b 100644
+index 08c2cc9..a14f406 100644
 --- a/gst-meet/src/main.rs
 +++ b/gst-meet/src/main.rs
 @@ -23,8 +23,11 @@ use tracing::{error, info, trace, warn};
@@ -3536,7 +3536,23 @@ index 08c2cc9..1c19a6b 100644
  
    #[structopt(
      long,
-@@ -221,7 +224,9 @@ async fn main_inner() -> Result<()> {
+@@ -84,6 +87,15 @@ struct Opt {
+   )]
+   recv_pipeline_participant_template: Option<String>,
+ 
++  #[structopt(long)]
++  recv_audio_source_template: Option<String>,
++  #[structopt(long)]
++  recv_video_source_template: Option<String>,
++  #[structopt(long)]
++  recording_metadata_dir: Option<String>,
++  #[structopt(long)]
++  session_started_unix_ns: Option<u64>,
++
+   #[structopt(
+     long,
+     help = "Comma-separated endpoint IDs to select (prioritise receiving of)"
+@@ -221,7 +233,9 @@ async fn main_inner() -> Result<()> {
      .transpose()
      .context("failed to parse recv pipeline")?;
  
@@ -3547,7 +3563,7 @@ index 08c2cc9..1c19a6b 100644
    let mut web_socket_url_parts = web_socket_url.into_parts();
    web_socket_url_parts.path_and_query = web_socket_url_parts
      .path_and_query
-@@ -231,17 +236,14 @@ async fn main_inner() -> Result<()> {
+@@ -231,17 +245,14 @@ async fn main_inner() -> Result<()> {
          .map(serde_urlencoded::from_str)
          .transpose()?
          .unwrap_or_default();
@@ -3571,7 +3587,7 @@ index 08c2cc9..1c19a6b 100644
      })
      .transpose()?;
  
-@@ -253,10 +255,7 @@ async fn main_inner() -> Result<()> {
+@@ -253,10 +264,7 @@ async fn main_inner() -> Result<()> {
      .or_else(|| web_socket_url.host())
      .context("invalid WebSocket URL")?;
  
@@ -3583,7 +3599,7 @@ index 08c2cc9..1c19a6b 100644
        Some(username) => Authentication::Plain {
          username,
          password: opt
-@@ -267,17 +266,24 @@ async fn main_inner() -> Result<()> {
+@@ -267,17 +275,24 @@ async fn main_inner() -> Result<()> {
          Some(token) => Authentication::Jwt { token },
          None => Authentication::Anonymous,
        },
@@ -3619,6 +3635,43 @@ index 08c2cc9..1c19a6b 100644
  
    connection.connect().await?;
  
+@@ -300,6 +315,10 @@ async fn main_inner() -> Result<()> {
+     region,
+     video_codec,
+     recv_pipeline_participant_template,
++    recv_audio_source_template,
++    recv_video_source_template,
++    recording_metadata_dir,
++    session_started_unix_ns,
+     send_video_height,
+     recv_video_scale_height,
+     recv_video_scale_width,
+@@ -324,6 +343,10 @@ async fn main_inner() -> Result<()> {
+     stereo: stereo.unwrap_or_default(),
+     recv_video_scale_height,
+     recv_video_scale_width,
++    recv_audio_source_template,
++    recv_video_source_template,
++    recording_metadata_dir,
++    session_started_unix_ns,
+     buffer_size,
+     #[cfg(feature = "log-rtp")]
+     log_rtp,
+diff --git a/lib-gst-meet-c/src/lib.rs b/lib-gst-meet-c/src/lib.rs
+index e881c07..f6391d8 100644
+--- a/lib-gst-meet-c/src/lib.rs
++++ b/lib-gst-meet-c/src/lib.rs
+@@ -166,6 +166,10 @@ pub unsafe extern "C" fn gstmeet_connection_join_conference(
+ 
+     recv_video_scale_width: 1280,
+     recv_video_scale_height: 720,
++    recv_audio_source_template: None,
++    recv_video_source_template: None,
++    recording_metadata_dir: None,
++    session_started_unix_ns: None,
+ 
+     buffer_size: 200,
+ 
 diff --git a/lib-gst-meet/Cargo.toml b/lib-gst-meet/Cargo.toml
 index 9a2ed7f..828971a 100644
 --- a/lib-gst-meet/Cargo.toml
@@ -3640,6 +3693,225 @@ index 9a2ed7f..828971a 100644
  tracing = { version = "0.1", default-features = false, features = ["attributes", "std"] }
  tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = [
    "fmt",
+diff --git a/lib-gst-meet/src/conference.rs b/lib-gst-meet/src/conference.rs
+index 83f095b..768e4e3 100644
+--- a/lib-gst-meet/src/conference.rs
++++ b/lib-gst-meet/src/conference.rs
+@@ -91,6 +91,10 @@ pub struct JitsiConferenceConfig {
+ 
+   pub recv_video_scale_width: u16,
+   pub recv_video_scale_height: u16,
++  pub recv_audio_source_template: Option<String>,
++  pub recv_video_source_template: Option<String>,
++  pub recording_metadata_dir: Option<String>,
++  pub session_started_unix_ns: Option<u64>,
+ 
+   pub buffer_size: u32,
+ 
+@@ -269,10 +273,15 @@ impl JitsiConference {
+ 
+   #[tracing::instrument(level = "debug", err)]
+   pub async fn leave(self) -> Result<()> {
+-    if let Some(jingle_session) = self.jingle_session.lock().await.take() {
++    if let Some(mut jingle_session) = self.jingle_session.lock().await.take() {
+       debug!("pausing all sinks");
+       jingle_session.pause_all_sinks();
+ 
++      if self.config.recording_metadata_dir.is_some() {
++        debug!("finalizing recording tracks");
++        jingle_session.finalize_recordings().await;
++      }
++
+       debug!("setting pipeline state to NULL");
+       if let Err(e) = jingle_session.pipeline().set_state(gstreamer::State::Null) {
+         warn!("failed to set pipeline state to NULL: {:?}", e);
+diff --git a/lib-gst-meet/src/jingle.rs b/lib-gst-meet/src/jingle.rs
+index 58db4ff..cd59d81 100644
+--- a/lib-gst-meet/src/jingle.rs
++++ b/lib-gst-meet/src/jingle.rs
+@@ -1,4 +1,4 @@
+-use std::{collections::HashMap, fmt, net::SocketAddr};
++use std::{collections::HashMap, fmt, net::SocketAddr, time::{SystemTime, UNIX_EPOCH}};
+ 
+ use anyhow::{anyhow, bail, Context, Result};
+ use futures::stream::StreamExt as _;
+@@ -9,7 +9,7 @@ use glib::{
+ use gstreamer::{
+   prelude::{
+     ElementExt as _, ElementExtManual as _, GObjectExtManualGst as _, GstBinExt as _,
+-    GstBinExtManual as _, GstObjectExt as _, PadExt as _,
++    GstBinExtManual as _, GstObjectExt as _, PadExt as _, PadExtManual as _,
+   },
+   Bin, GhostPad,
+ };
+@@ -57,6 +57,10 @@ const RTP_HDREXT_TRANSPORT_CC: &str =
+ const DEFAULT_STUN_PORT: u16 = 3478;
+ const DEFAULT_TURNS_PORT: u16 = 5349;
+ 
++fn safe_track_component(value: &str) -> String {
++  value.chars().take(64).map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect()
++}
++
+ #[derive(Clone, PartialEq)]
+ enum CodecName {
+   Opus,
+@@ -165,6 +169,7 @@ pub(crate) struct JingleSession {
+   pub(crate) colibri_channel: Option<ColibriChannel>,
+   pub(crate) stats_handler_task: Option<JoinHandle<()>>,
+   pipeline_state_null_rx: oneshot::Receiver<()>,
++  pipeline_eos_rx: oneshot::Receiver<()>,
+ }
+ 
+ impl fmt::Debug for JingleSession {
+@@ -206,6 +211,16 @@ impl JingleSession {
+     Ok(self.pipeline_state_null_rx.await?)
+   }
+ 
++  pub(crate) async fn finalize_recordings(&mut self) {
++    if !self.pipeline.send_event(gstreamer::event::Eos::new()) {
++      warn!("failed to send EOS to recording pipeline");
++      return;
++    }
++    if tokio::time::timeout(std::time::Duration::from_secs(4), &mut self.pipeline_eos_rx).await.is_err() {
++      warn!("timed out waiting for recording pipeline EOS");
++    }
++  }
++
+   fn parse_rtp_description(
+     description: &RtpDescription,
+     remote_ssrc_map: &mut HashMap<u32, Source>,
+@@ -343,6 +358,8 @@ impl JingleSession {
+         Source {
+           ssrc: ssrc.id,
+           participant_id: participant_id_for_owner(owner)?,
++          name: ssrc.name.clone(),
++          video_type: ssrc.video_type.clone(),
+           media_type: if description.media == "audio" {
+             MediaType::Audio
+           }
+@@ -846,6 +863,11 @@ impl JingleSession {
+ 
+             debug!("pad added for remote source: {:?}", source);
+ 
++            let source_template = match source.media_type {
++              MediaType::Audio => conference.config.recv_audio_source_template.as_ref(),
++              MediaType::Video => conference.config.recv_video_source_template.as_ref(),
++            };
++
+             let (maybe_participant_id, maybe_sink_element, maybe_participant_bin) =
+               if let Some(participant_id) = source.participant_id {
+                 handle.block_on(conference.ensure_participant(&participant_id))?;
+@@ -871,7 +893,7 @@ impl JingleSession {
+               };
+ 
+             if maybe_participant_id.is_none()
+-              || (maybe_sink_element.is_none() && maybe_participant_bin.is_none())
++              || (source_template.is_none() && maybe_sink_element.is_none() && maybe_participant_bin.is_none())
+             {
+               debug!("nothing to link to decoder, adding fakesink");
+               let fakesink = gstreamer::ElementFactory::make("fakesink").build()?;
+@@ -1059,7 +1081,54 @@ impl JingleSession {
+               },
+             };
+ 
+-            if let Some(sink_element) = maybe_sink_element {
++            if let Some(template) = source_template {
++              let source_name = source.name.as_deref().unwrap_or("unknown");
++              let track_id = format!("{}-{}-{}", safe_track_component(&participant_id), safe_track_component(source_name), ssrc);
++              let media_kind = match source.media_type { MediaType::Audio => "audio", MediaType::Video => "video" };
++              let description = template.replace("{track_id}", &track_id).replace("{participant_id}", &safe_track_component(&participant_id));
++              let bin = gstreamer::parse::bin_from_description(&description, false)
++                .context("failed to parse recv source template")?;
++              let track = bin.by_name("track").context("recv source template has no track element")?;
++              let sink_pad = track.static_pad("sink").context("track element has no sink pad")?;
++              bin.add_pad(&GhostPad::builder_with_target(&sink_pad)?.name("track").build())?;
++              bin.set_property("name", format!("track_{}_{}", media_kind, ssrc));
++              pipeline.add(&bin)?;
++              bin.sync_state_with_parent()?;
++              let ghost = bin.static_pad("track").context("track bin has no ghost pad")?;
++
++              if let (Some(dir), Some(session_start)) =
++                (&conference.config.recording_metadata_dir, conference.config.session_started_unix_ns) {
++                let metadata_path = format!("{}/{}-{}.track.json", dir, track_id, media_kind);
++                let file_name = format!("{}-{}.webm", track_id, media_kind);
++                let participant_id = participant_id.clone();
++                let source_name = source.name.clone();
++                let video_type = source.video_type.clone();
++                src_pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_pad, probe| {
++                  let pts = probe.buffer().and_then(|buffer| buffer.pts()).map(|pts| pts.nseconds());
++                  let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
++                  let metadata = serde_json::json!({
++                    "schema_version": 1,
++                    "participant_id": participant_id,
++                    "source_name": source_name,
++                    "source_type": video_type,
++                    "media_type": media_kind,
++                    "ssrc": ssrc,
++                    "file": file_name,
++                    "first_buffer_pts_ns": pts,
++                    "first_buffer_unix_ns": now,
++                    "first_buffer_session_offset_ns": now.saturating_sub(session_start as u128),
++                    "clock": "system_unix_ns_at_first_decoded_buffer"
++                  });
++                  if let Err(error) = std::fs::write(&metadata_path, metadata.to_string()) {
++                    error!("failed to write track metadata {}: {}", metadata_path, error);
++                  }
++                  gstreamer::PadProbeReturn::Remove
++                });
++              }
++              src_pad.link(&ghost).context("failed to link source to track bin")?;
++              info!("linked {}/{} ({}) to independent recording track", participant_id, source_name, media_kind);
++            }
++            else if let Some(sink_element) = maybe_sink_element {
+               let sink_pad = sink_element
+                 .request_pad_simple("sink_%u")
+                 .context("no suitable sink pad provided by sink element in recv pipeline")?;
+@@ -1313,10 +1382,15 @@ impl JingleSession {
+     let bus = pipeline.bus().context("failed to get pipeline bus")?;
+ 
+     let (pipeline_state_null_tx, pipeline_state_null_rx) = oneshot::channel();
++    let (pipeline_eos_tx, pipeline_eos_rx) = oneshot::channel();
+     tokio::spawn(async move {
+       let mut stream = bus.stream();
++      let mut pipeline_eos_tx = Some(pipeline_eos_tx);
+       while let Some(msg) = stream.next().await {
+         match msg.view() {
++          gstreamer::MessageView::Eos(..) => {
++            if let Some(tx) = pipeline_eos_tx.take() { let _ = tx.send(()); }
++          },
+           gstreamer::MessageView::Error(e) => {
+             if let Some(d) = e.debug() {
+               error!("{}", d);
+@@ -1532,6 +1606,7 @@ impl JingleSession {
+       colibri_channel: None,
+       stats_handler_task: None,
+       pipeline_state_null_rx,
++      pipeline_eos_rx,
+     })
+   }
+ 
+@@ -1552,6 +1627,8 @@ impl JingleSession {
+             Source {
+               ssrc: ssrc.id,
+               participant_id: participant_id_for_owner(owner)?,
++              name: ssrc.name.clone(),
++              video_type: ssrc.video_type.clone(),
+               media_type: if description.media == "audio" {
+                 MediaType::Audio
+               }
+diff --git a/lib-gst-meet/src/source.rs b/lib-gst-meet/src/source.rs
+index 8dbec9a..bbdcf75 100644
+--- a/lib-gst-meet/src/source.rs
++++ b/lib-gst-meet/src/source.rs
+@@ -3,6 +3,8 @@ pub(crate) struct Source {
+   pub(crate) ssrc: u32,
+   pub(crate) participant_id: Option<String>,
+   pub(crate) media_type: MediaType,
++  pub(crate) name: Option<String>,
++  pub(crate) video_type: Option<String>,
+ }
+ 
+ #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 diff --git a/lib-gst-meet/src/xmpp/connection.rs b/lib-gst-meet/src/xmpp/connection.rs
 index 78a14b9..fa507e0 100644
 --- a/lib-gst-meet/src/xmpp/connection.rs

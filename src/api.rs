@@ -22,7 +22,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::{encode_room, recording_pipeline, video_bitrate};
+use crate::{
+    encode_room, recording_pipelines, session_started_unix_ns, video_bitrate,
+    write_session_timeline,
+};
 
 mod records;
 
@@ -148,13 +151,20 @@ async fn join(
             format!("cannot save session metadata: {error}"),
         )
     })?;
-    let pipeline = recording_pipeline(&dir, state.video_bitrate);
+    let started = session_started_unix_ns()
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    write_session_timeline(&dir, started)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let (audio_pipeline, video_pipeline) = recording_pipelines(&dir, state.video_bitrate);
     let mut command = Command::new(&*state.gst_meet_bin);
     command
         .arg(format!("--bosh-url={}", state.bosh_url))
         .arg(format!("--room-name={}", encode_room(&room)))
         .arg(format!("--nick={nick}"))
-        .arg(format!("--recv-pipeline-participant-template={pipeline}"))
+        .arg(format!("--recv-audio-source-template={audio_pipeline}"))
+        .arg(format!("--recv-video-source-template={video_pipeline}"))
+        .arg(format!("--recording-metadata-dir={dir}"))
+        .arg(format!("--session-started-unix-ns={started}"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

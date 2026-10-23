@@ -3,6 +3,7 @@ use std::{
     os::unix::process::CommandExt,
     path::PathBuf,
     process::{Command, ExitCode, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 mod api;
@@ -189,13 +190,18 @@ fn record() -> Result<(), String> {
     }
     fs::create_dir_all(&output_dir)
         .map_err(|e| format!("cannot create recordings directory: {e}"))?;
-    let pipeline = recording_pipeline(&output_dir, video_bitrate()?);
+    let (audio_pipeline, video_pipeline) = recording_pipelines(&output_dir, video_bitrate()?);
+    let started = session_started_unix_ns()?;
+    write_session_timeline(&output_dir, started)?;
     println!("Recording room {room} (XMPP name {encoded_room}) to {output_dir}");
     let error = Command::new("gst-meet")
         .arg(format!("--bosh-url={bosh_url}"))
         .arg(format!("--room-name={encoded_room}"))
         .arg(format!("--nick={nick}"))
-        .arg(format!("--recv-pipeline-participant-template={pipeline}"))
+        .arg(format!("--recv-audio-source-template={audio_pipeline}"))
+        .arg(format!("--recv-video-source-template={video_pipeline}"))
+        .arg(format!("--recording-metadata-dir={output_dir}"))
+        .arg(format!("--session-started-unix-ns={started}"))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -214,11 +220,24 @@ pub(crate) fn video_bitrate() -> Result<u32, String> {
     Ok(kbps * 1000)
 }
 
-pub(crate) fn recording_pipeline(output_dir: &str, video_bitrate: u32) -> String {
-    format!(
-        "audioconvert name=audio ! audioresample ! opusenc ! webmmux streamable=true ! filesink location={output_dir}/{{participant_id}}-audio.webm \
-         videoconvert name=video ! vp8enc target-bitrate={video_bitrate} deadline=1000000 cpu-used=4 threads=4 ! webmmux streamable=true ! filesink location={output_dir}/{{participant_id}}-video.webm"
+pub(crate) fn recording_pipelines(output_dir: &str, video_bitrate: u32) -> (String, String) {
+    (
+        format!("audioconvert name=track ! audioresample ! opusenc ! webmmux ! filesink location={output_dir}/{{track_id}}-audio.webm"),
+        format!("videoconvert name=track ! vp8enc target-bitrate={video_bitrate} deadline=1000000 cpu-used=4 threads=4 ! webmmux ! filesink location={output_dir}/{{track_id}}-video.webm"),
     )
+}
+
+pub(crate) fn session_started_unix_ns() -> Result<u64, String> {
+    let ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    u64::try_from(ns).map_err(|_| "system clock exceeds timestamp range".into())
+}
+
+pub(crate) fn write_session_timeline(dir: &str, started: u64) -> Result<(), String> {
+    fs::write(format!("{dir}/timeline.json"), format!("{{\"schema_version\":1,\"session_started_unix_ns\":{started},\"clock\":\"system_unix_ns\"}}"))
+        .map_err(|e| format!("cannot save session timeline: {e}"))
 }
 
 pub(crate) fn encode_room(room: &str) -> String {
