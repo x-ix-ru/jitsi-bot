@@ -3761,7 +3761,7 @@ index 83f095b..5dc9213 100644
                        && self
                          .inner
 diff --git a/lib-gst-meet/src/jingle.rs b/lib-gst-meet/src/jingle.rs
-index 58db4ff..31f28fc 100644
+index 58db4ff..99d81e2 100644
 --- a/lib-gst-meet/src/jingle.rs
 +++ b/lib-gst-meet/src/jingle.rs
 @@ -1,4 +1,4 @@
@@ -3845,7 +3845,43 @@ index 58db4ff..31f28fc 100644
              {
                debug!("nothing to link to decoder, adding fakesink");
                let fakesink = gstreamer::ElementFactory::make("fakesink").build()?;
-@@ -1059,7 +1081,56 @@ impl JingleSession {
+@@ -886,6 +908,35 @@ impl JingleSession {
+ 
+             let participant_id = maybe_participant_id.unwrap();
+ 
++            // A forwarded video codec may differ from the codec selected for our
++            // outgoing stream. Keep the RTP pad linked even when this runtime
++            // cannot decode it, so an unsupported video stream does not stop
++            // the participant's audio pipeline.
++            if source.media_type == MediaType::Video {
++              let supported = codecs
++                .iter()
++                .filter(|codec| codec.is_video())
++                .find(|codec| codec.is(pt))
++                .is_some_and(|codec| {
++                  let available = gstreamer::ElementFactory::find(codec.depayloader_name()).is_some()
++                    && gstreamer::ElementFactory::find(codec.decoder_name()).is_some();
++                  if !available {
++                    warn!("ignoring video PT {} ({}): depayloader or decoder unavailable", pt, codec.encoding_name());
++                  }
++                  available
++                });
++              if !supported {
++                let fakesink = gstreamer::ElementFactory::make("fakesink")
++                  .property("sync", false)
++                  .build()?;
++                pipeline.add(&fakesink)?;
++                fakesink.sync_state_with_parent()?;
++                let sink_pad = fakesink.static_pad("sink").context("fakesink has no sink pad")?;
++                pad.link(&sink_pad)?;
++                return Ok(());
++              }
++            }
++
+             let depayloader = match source.media_type {
+               MediaType::Audio => {
+                 let codec = codecs
+@@ -1059,7 +1110,56 @@ impl JingleSession {
                },
              };
  
@@ -3903,7 +3939,7 @@ index 58db4ff..31f28fc 100644
                let sink_pad = sink_element
                  .request_pad_simple("sink_%u")
                  .context("no suitable sink pad provided by sink element in recv pipeline")?;
-@@ -1313,10 +1384,15 @@ impl JingleSession {
+@@ -1313,10 +1413,15 @@ impl JingleSession {
      let bus = pipeline.bus().context("failed to get pipeline bus")?;
  
      let (pipeline_state_null_tx, pipeline_state_null_rx) = oneshot::channel();
@@ -3919,7 +3955,7 @@ index 58db4ff..31f28fc 100644
            gstreamer::MessageView::Error(e) => {
              if let Some(d) = e.debug() {
                error!("{}", d);
-@@ -1532,6 +1608,7 @@ impl JingleSession {
+@@ -1532,6 +1637,7 @@ impl JingleSession {
        colibri_channel: None,
        stats_handler_task: None,
        pipeline_state_null_rx,
@@ -3927,7 +3963,7 @@ index 58db4ff..31f28fc 100644
      })
    }
  
-@@ -1552,6 +1629,8 @@ impl JingleSession {
+@@ -1552,6 +1658,8 @@ impl JingleSession {
              Source {
                ssrc: ssrc.id,
                participant_id: participant_id_for_owner(owner)?,
