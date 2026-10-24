@@ -190,7 +190,8 @@ fn record() -> Result<(), String> {
     }
     fs::create_dir_all(&output_dir)
         .map_err(|e| format!("cannot create recordings directory: {e}"))?;
-    let (audio_pipeline, video_pipeline) = recording_pipelines(&output_dir, video_bitrate()?);
+    let (audio_pipeline, video_pipeline) =
+        recording_pipelines(&output_dir, video_bitrate()?, false);
     let started = session_started_unix_ns()?;
     write_session_timeline(&output_dir, started)?;
     println!("Recording room {room} (XMPP name {encoded_room}) to {output_dir}");
@@ -220,9 +221,18 @@ pub(crate) fn video_bitrate() -> Result<u32, String> {
     Ok(kbps * 1000)
 }
 
-pub(crate) fn recording_pipelines(output_dir: &str, video_bitrate: u32) -> (String, String) {
+pub(crate) fn recording_pipelines(
+    output_dir: &str,
+    video_bitrate: u32,
+    live_audio: bool,
+) -> (String, String) {
+    let audio = if live_audio {
+        format!("audioconvert name=track ! tee name=split split. ! queue ! audioresample ! opusenc ! webmmux ! filesink location={output_dir}/{{track_id}}-audio.webm split. ! queue ! audioresample ! audio/x-raw,format=S16LE,rate=16000,channels=1 ! filesink location={output_dir}/{{track_id}}-audio.s16le")
+    } else {
+        format!("audioconvert name=track ! audioresample ! opusenc ! webmmux ! filesink location={output_dir}/{{track_id}}-audio.webm")
+    };
     (
-        format!("audioconvert name=track ! audioresample ! opusenc ! webmmux ! filesink location={output_dir}/{{track_id}}-audio.webm"),
+        audio,
         format!("videoconvert name=track ! vp8enc target-bitrate={video_bitrate} deadline=1000000 cpu-used=4 threads=4 ! webmmux ! filesink location={output_dir}/{{track_id}}-video.webm"),
     )
 }

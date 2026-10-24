@@ -9,15 +9,28 @@ use axum::{
     extract::{Form, Path, Query, State},
     http::{header, HeaderMap, Request, StatusCode},
     response::{Html, IntoResponse, Response},
+    Json,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use uuid::Uuid;
 
-use super::AppState;
+use super::{meeting_room, start_session, transcription, AppState};
+
+#[derive(Deserialize)]
+pub(super) struct MeetingForm {
+    url: String,
+}
+
+#[derive(Serialize)]
+struct JournalSnapshot {
+    entries: Vec<transcription::JournalLine>,
+    status: &'static str,
+    error: Option<String>,
+}
 
 struct RecordRow {
     id: Uuid,
@@ -349,7 +362,7 @@ fn safe_participant(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-async fn page(state: &AppState, selected: Option<Uuid>) -> Response {
+async fn page(state: &AppState, selected: Option<Uuid>, error: Option<&str>) -> Response {
     let rows = match list(state).await {
         Ok(rows) => rows,
         Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
@@ -446,18 +459,36 @@ async fn page(state: &AppState, selected: Option<Uuid>) -> Response {
         if cards.is_empty() {
             cards.push_str("<section class=\"card\"><p>Файлов пока нет. Записи появятся, когда участник включит камеру или микрофон.</p></section>");
         }
+        let journal_lines = transcription::read_journal(
+            &PathBuf::from(state.recordings_dir.as_ref()).join(id.to_string()),
+        );
+        let mut journal = String::new();
+        for line in journal_lines {
+            journal.push_str(&format!("<li><button type=\"button\" class=\"journal-line\" data-seek=\"{:.2}\"><span>+{:.0} с · {}</span><strong>{}</strong></button></li>", line.offset_seconds, line.offset_seconds, escape(&line.participant), escape(&line.text)));
+        }
+        let journal_hint = if state.transcription.is_some() {
+            "Журнал обновляется во время встречи. Автоматическая расшифровка может содержать ошибки."
+        } else {
+            "Для новых встреч задайте TRANSCRIPTION_URL, чтобы включить живую расшифровку."
+        };
         format!(
-            "<div class=\"eyebrow\">Сессия {id}</div><h1>{room}</h1><div class=\"badge\">{status}</div><p class=\"hint\">Каждая дорожка имеет начало на общей шкале встречи. Камера, экран и звук отображаются отдельно.</p><div class=\"sync\"><button type=\"button\" id=\"play-all\">▶ Воспроизвести все</button><button type=\"button\" id=\"pause-all\">Пауза</button><input id=\"timeline\" type=\"range\" min=\"0\" max=\"1\" step=\"0.01\" value=\"0\" aria-label=\"Время встречи\"><span id=\"time-label\">0:00</span></div>{cards}",
+            "<div class=\"eyebrow\">Сессия {id}</div><h1>{room}</h1><div class=\"badge\" id=\"session-status\">{status}</div><p class=\"hint\">Каждая дорожка имеет начало на общей шкале встречи. Камера, экран и звук отображаются отдельно.</p><section class=\"journal card\" data-session=\"{id}\"><h2>Журнал встречи</h2><p class=\"hint\">{journal_hint}</p><p id=\"journal-error\" class=\"form-error\" hidden></p><ol id=\"journal-lines\">{journal}</ol></section><div class=\"sync\"><button type=\"button\" id=\"play-all\">▶ Воспроизвести все</button><button type=\"button\" id=\"pause-all\">Пауза</button><input id=\"timeline\" type=\"range\" min=\"0\" max=\"1\" step=\"0.01\" value=\"0\" aria-label=\"Время встречи\"><span id=\"time-label\">0:00</span></div>{cards}",
             room = escape(row.room.trim()),
             status = status_label(row.status),
         )
     } else {
         "<h1>Записи Jitsi</h1><p class=\"hint\">Выберите сессию слева, чтобы открыть запись участника. Завершённые записи остаются здесь после перезапуска сервиса.</p>".into()
     };
+    let error_html = error
+        .map(|message| format!("<p class=\"form-error\">{}</p>", escape(message)))
+        .unwrap_or_default();
     let html = format!(
         r#"<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Записи Jitsi</title><style>
-*{{box-sizing:border-box}}body{{margin:0;background:#0b1220;color:#eaf0fa;font:16px/1.5 system-ui,-apple-system,sans-serif}}a{{color:inherit}}.layout{{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}}aside{{background:#111c2e;border-right:1px solid #26364b;padding:28px 18px}}aside header{{display:flex;align-items:center;justify-content:space-between;padding:0 10px 22px}}aside header a{{color:#8fc6ff;font-size:13px;text-decoration:none}}aside h2{{font-size:18px;margin:0}}.session{{display:block;padding:14px 15px;margin:5px 0;border-radius:12px;text-decoration:none;color:#d5dfec}}.session:hover,.selected{{background:#203149}}.session strong{{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.session small{{display:block;color:#96a9bf;margin-top:3px}}main{{max-width:1100px;width:100%;margin:0 auto;padding:46px 42px}}h1{{font-size:32px;margin:5px 0 12px}}.eyebrow{{font-size:13px;color:#8fb6d9;word-break:break-all}}.badge{{display:inline-block;background:#173c3a;color:#a4edce;border-radius:999px;padding:5px 12px;font-size:13px;margin-bottom:16px}}.hint,.empty{{color:#a9bad0}}.sync{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:14px;background:#172438;border-radius:12px}}.sync button{{background:#7bbaf2;color:#071120;border:0;border-radius:8px;padding:8px 12px;cursor:pointer}}.sync input{{flex:1;min-width:150px}}.card{{background:#172438;border:1px solid #2b3d55;border-radius:16px;padding:24px;margin-top:22px}}.card h2{{font-size:19px;margin:0 0 16px}}video{{display:block;width:100%;max-height:70vh;background:#080d15;border-radius:10px}}audio{{display:block;width:100%;margin-top:18px}}.download{{display:inline-block;color:#9bd0ff;font-size:14px;margin-top:8px}}@media(max-width:760px){{.layout{{grid-template-columns:1fr}}aside{{border-right:0;border-bottom:1px solid #26364b;padding:16px}}aside header{{padding:0 5px 8px}}main{{padding:25px 18px}}.session{{display:inline-block;min-width:170px;max-width:240px}}}}
-</style></head><body><div class="layout"><aside><header><h2><a href="/records">Записи</a></h2><a href="">Обновить ↻</a></header>{nav}</aside><main>{content}</main></div><script>
+*{{box-sizing:border-box}}body{{margin:0;background:#0b1220;color:#eaf0fa;font:16px/1.5 system-ui,-apple-system,sans-serif}}a{{color:inherit}}.layout{{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}}aside{{background:#111c2e;border-right:1px solid #26364b;padding:28px 18px}}aside header{{display:flex;align-items:center;justify-content:space-between;padding:0 10px 22px}}aside header a{{color:#8fc6ff;font-size:13px;text-decoration:none}}aside h2{{font-size:18px;margin:0}}.add-meeting,.dialog-submit{{width:100%;background:#7bbaf2;color:#071120;border:0;border-radius:10px;padding:11px 12px;font:inherit;font-weight:700;cursor:pointer}}.add-meeting{{margin:0 0 15px}}.session{{display:block;padding:14px 15px;margin:5px 0;border-radius:12px;text-decoration:none;color:#d5dfec}}.session:hover,.selected{{background:#203149}}.session strong{{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.session small{{display:block;color:#96a9bf;margin-top:3px}}main{{max-width:1100px;width:100%;margin:0 auto;padding:46px 42px}}h1{{font-size:32px;margin:5px 0 12px}}.eyebrow{{font-size:13px;color:#8fb6d9;word-break:break-all}}.badge{{display:inline-block;background:#173c3a;color:#a4edce;border-radius:999px;padding:5px 12px;font-size:13px;margin-bottom:16px}}.hint,.empty{{color:#a9bad0}}.sync{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:14px;background:#172438;border-radius:12px}}.sync button{{background:#7bbaf2;color:#071120;border:0;border-radius:8px;padding:8px 12px;cursor:pointer}}.sync input{{flex:1;min-width:150px}}.card{{background:#172438;border:1px solid #2b3d55;border-radius:16px;padding:24px;margin-top:22px}}.card h2{{font-size:19px;margin:0 0 16px}}video{{display:block;width:100%;max-height:70vh;background:#080d15;border-radius:10px}}audio{{display:block;width:100%;margin-top:18px}}.download{{display:inline-block;color:#9bd0ff;font-size:14px;margin-top:8px}}.journal ol{{padding-left:20px;max-height:320px;overflow:auto}}.journal li{{margin:10px 0}}.journal-line{{display:block;text-align:left;width:100%;background:#203149;color:#eaf0fa;border:0;border-radius:8px;padding:10px;cursor:pointer}}.journal-line span{{display:block;color:#9bc8ee;font-size:13px}}.journal-line strong{{font-weight:500}}dialog{{width:min(530px,calc(100% - 30px));border:1px solid #506780;border-radius:16px;padding:24px;background:#172438;color:#eaf0fa}}dialog::backdrop{{background:#000a}}dialog h2{{margin-top:0}}dialog input{{display:block;width:100%;margin:8px 0 18px;padding:12px;border:1px solid #506780;border-radius:8px;background:#0b1220;color:#fff;font:inherit}}.dialog-actions{{display:flex;gap:10px}}.dialog-actions button{{flex:1}}.dialog-cancel{{background:transparent;color:#d5dfec;border:1px solid #506780;border-radius:10px;font:inherit;cursor:pointer}}.form-error{{color:#ffb8af}}@media(max-width:760px){{.layout{{grid-template-columns:1fr}}aside{{border-right:0;border-bottom:1px solid #26364b;padding:16px}}aside header{{padding:0 5px 8px}}main{{padding:25px 18px}}.session{{display:inline-block;min-width:170px;max-width:240px}}}}
+</style></head><body><div class="layout"><aside><header><h2><a href="/records">Записи</a></h2><a href="">Обновить ↻</a></header><button class="add-meeting" type="button" id="add-meeting">＋ Добавить встречу</button>{nav}</aside><main>{error_html}{content}</main></div><dialog id="meeting-dialog"><h2>Добавить встречу</h2><p class="hint">Вставьте ссылку Jitsi. Бот войдёт в комнату и начнёт запись.</p><form method="post" action="/records/new"><label for="meeting-url">Ссылка на встречу</label><input id="meeting-url" name="url" type="url" placeholder="https://meet.example.org/комната" required autofocus><div class="dialog-actions"><button class="dialog-cancel" type="button" id="cancel-meeting">Отмена</button><button class="dialog-submit" type="submit">Подключить бота</button></div></form></dialog><script>
+const meetingDialog=document.getElementById('meeting-dialog');document.getElementById('add-meeting').onclick=()=>meetingDialog.showModal();document.getElementById('cancel-meeting').onclick=()=>meetingDialog.close();
+const journal=document.querySelector('.journal[data-session]');if(journal){{const lines=document.getElementById('journal-lines');const session=journal.dataset.session;const fmt=t=>`${{Math.floor(t/60)}}:${{String(Math.floor(t%60)).padStart(2,'0')}}`;const labels={{starting:'Подключается',joined:'Идёт запись',stopping:'Завершается',stopped:'Завершена',exited:'Отключена',archived:'Сохранена'}};async function refreshJournal(){{try{{const r=await fetch(`/records/${{session}}/journal`,{{cache:'no-store'}});if(!r.ok)return;const data=await r.json();document.getElementById('session-status').textContent=labels[data.status]||data.status;const error=document.getElementById('journal-error');error.hidden=!data.error;error.textContent=data.error?`Ошибка транскрибации: ${{data.error}}`:'';lines.replaceChildren(...data.entries.map(item=>{{const li=document.createElement('li');const button=document.createElement('button');button.type='button';button.className='journal-line';button.dataset.seek=item.offset_seconds;const time=document.createElement('span');time.textContent=`${{fmt(item.offset_seconds)}} · ${{item.participant}}`;const text=document.createElement('strong');text.textContent=item.text;button.append(time,text);li.append(button);return li;}}));}}catch(_){{}}}}refreshJournal();setInterval(refreshJournal,5000);}}
+document.addEventListener('click',event=>{{const button=event.target.closest('.journal-line');const slider=document.getElementById('timeline');if(button&&slider){{slider.value=button.dataset.seek;slider.dispatchEvent(new Event('input'));}}}});
 (() => {{ const slider=document.getElementById('timeline'); if(!slider)return;
 const media=[...document.querySelectorAll('video[data-offset],audio[data-offset]')];
 const label=document.getElementById('time-label'); let playing=false, at=0, last=performance.now();
@@ -483,7 +514,7 @@ pub(super) async fn index(State(state): State<AppState>, request: Request<Body>)
     if !authenticated(request.headers(), &state).await {
         return login_redirect("/records");
     }
-    page(&state, None).await
+    page(&state, None, None).await
 }
 
 pub(super) async fn show(
@@ -494,7 +525,63 @@ pub(super) async fn show(
     if !authenticated(request.headers(), &state).await {
         return login_redirect(&format!("/records/{id}"));
     }
-    page(&state, Some(id)).await
+    page(&state, Some(id), None).await
+}
+
+pub(super) async fn add_meeting(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<MeetingForm>,
+) -> Response {
+    if !authenticated(&headers, &state).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let room = match meeting_room(&form.url, &state.bosh_url) {
+        Ok(room) => room,
+        Err(error) => return page(&state, None, Some(&error)).await,
+    };
+    match start_session(state.clone(), room, state.default_nick.to_string()).await {
+        Ok(info) => {
+            let mut response = StatusCode::SEE_OTHER.into_response();
+            response.headers_mut().insert(
+                header::LOCATION,
+                header::HeaderValue::from_str(&format!("/records/{}", info.session_id))
+                    .expect("safe id"),
+            );
+            response
+        }
+        Err((_, Json(error))) => page(&state, None, Some(&error.error)).await,
+    }
+}
+
+pub(super) async fn journal(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    request: Request<Body>,
+) -> Response {
+    if !authenticated(request.headers(), &state).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let dir = PathBuf::from(state.recordings_dir.as_ref()).join(id.to_string());
+    if !dir.is_dir() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let status = state
+        .sessions
+        .lock()
+        .await
+        .get(&id)
+        .map(|entry| entry.info.status)
+        .unwrap_or("archived");
+    let error = fs::read_to_string(dir.join("transcription-error.txt"))
+        .await
+        .ok();
+    Json(JournalSnapshot {
+        entries: transcription::read_journal(&dir),
+        status,
+        error,
+    })
+    .into_response()
 }
 
 pub(super) async fn media(

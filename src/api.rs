@@ -28,6 +28,7 @@ use crate::{
 };
 
 mod records;
+mod transcription;
 
 #[derive(Clone)]
 struct AppState {
@@ -38,6 +39,7 @@ struct AppState {
     recordings_dir: Arc<str>,
     gst_meet_bin: Arc<str>,
     video_bitrate: u32,
+    transcription: Option<transcription::Endpoint>,
     sessions: Arc<Mutex<HashMap<Uuid, SessionEntry>>>,
     web_sessions: Arc<Mutex<HashMap<Uuid, Instant>>>,
 }
@@ -61,6 +63,7 @@ struct SessionInfo {
 struct JoinRequest {
     room: Option<String>,
     nick: Option<String>,
+    url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -113,12 +116,22 @@ async fn join(
     Json(request): Json<JoinRequest>,
 ) -> ApiResult<(StatusCode, Json<SessionInfo>)> {
     authorized(&headers, &state)?;
-    let room = request
-        .room
-        .unwrap_or_else(|| state.default_room.to_string());
+    let room = match (request.room, request.url) {
+        (Some(_), Some(_)) => {
+            return Err(api_error(StatusCode::BAD_REQUEST, "provide room or url"))
+        }
+        (_, Some(url)) => meeting_room(&url, &state.bosh_url)
+            .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?,
+        (room, None) => room.unwrap_or_else(|| state.default_room.to_string()),
+    };
     let nick = request
         .nick
         .unwrap_or_else(|| state.default_nick.to_string());
+    let info = start_session(state, room, nick).await?;
+    Ok((StatusCode::ACCEPTED, Json(info)))
+}
+
+async fn start_session(state: AppState, room: String, nick: String) -> ApiResult<SessionInfo> {
     if !safe_name(&room) || !safe_name(&nick) {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -155,7 +168,8 @@ async fn join(
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     write_session_timeline(&dir, started)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let (audio_pipeline, video_pipeline) = recording_pipelines(&dir, state.video_bitrate);
+    let (audio_pipeline, video_pipeline) =
+        recording_pipelines(&dir, state.video_bitrate, state.transcription.is_some());
     let mut command = Command::new(&*state.gst_meet_bin);
     command
         .arg(format!("--bosh-url={}", state.bosh_url))
@@ -191,8 +205,81 @@ async fn join(
         },
     );
     drop(sessions);
+    if let Some(endpoint) = state.transcription.clone() {
+        tokio::spawn(transcription::run(
+            state.clone(),
+            id,
+            PathBuf::from(&info.recording_dir),
+            endpoint,
+        ));
+    }
     tokio::spawn(monitor(state, id, child, stop_rx));
-    Ok((StatusCode::ACCEPTED, Json(info)))
+    Ok(info)
+}
+
+fn meeting_room(url: &str, bosh_url: &str) -> Result<String, String> {
+    let (scheme, rest) = url
+        .trim()
+        .split_once("://")
+        .ok_or("Введите полную ссылку на встречу")?;
+    if scheme != "https" {
+        return Err("Ссылка на встречу должна начинаться с https://".into());
+    }
+    let (authority, path) = rest.split_once('/').ok_or("В ссылке нет имени комнаты")?;
+    let expected = bosh_url
+        .strip_prefix("https://")
+        .and_then(|value| value.split('/').next())
+        .ok_or("Неверный адрес Jitsi в настройках")?;
+    if !authority.eq_ignore_ascii_case(expected) {
+        return Err(format!("Поддерживаются встречи только на {expected}"));
+    }
+    let encoded = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+    if encoded.is_empty() || encoded.contains('/') {
+        return Err("В ссылке должно быть одно имя комнаты".into());
+    }
+    let mut bytes = Vec::new();
+    let mut input = encoded.as_bytes().iter().copied();
+    while let Some(byte) = input.next() {
+        if byte == b'%' {
+            let hi = input.next().and_then(|b| (b as char).to_digit(16));
+            let lo = input.next().and_then(|b| (b as char).to_digit(16));
+            let (Some(hi), Some(lo)) = (hi, lo) else {
+                return Err("Неверная кодировка ссылки".into());
+            };
+            bytes.push(((hi << 4) | lo) as u8);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    let room = String::from_utf8(bytes).map_err(|_| "Неверная кодировка имени комнаты")?;
+    if !safe_name(&room) {
+        return Err("Недопустимое имя комнаты".into());
+    }
+    Ok(room)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::meeting_room;
+
+    #[test]
+    fn accepts_only_configured_jitsi_host() {
+        let bosh = "https://meet.example.org/http-bind";
+        assert_eq!(
+            meeting_room(
+                "https://meet.example.org/%D0%BA%D0%BE%D0%BC%D0%BD%D0%B0%D1%82%D0%B0#config",
+                bosh
+            )
+            .unwrap(),
+            "комната"
+        );
+        assert!(meeting_room("https://other.example/комната", bosh).is_err());
+        assert!(meeting_room("https://meet.example.org/%2fsecret", bosh).is_err());
+    }
 }
 
 async fn session(
@@ -338,6 +425,11 @@ pub(crate) async fn serve() -> Result<(), String> {
             .unwrap_or_else(|_| "gst-meet".into())
             .into(),
         video_bitrate: video_bitrate()?,
+        transcription: env::var("TRANSCRIPTION_URL")
+            .ok()
+            .filter(|url| !url.is_empty())
+            .map(|url| transcription::Endpoint::parse(&url))
+            .transpose()?,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         web_sessions: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -350,11 +442,13 @@ pub(crate) async fn serve() -> Result<(), String> {
         .route("/api/jitsi-bot/sessions/{id}", get(session))
         .route("/api/jitsi-bot/sessions/{id}/leave", post(leave))
         .route("/records", get(records::index))
+        .route("/records/new", post(records::add_meeting))
         .route(
             "/records/login",
             get(records::login_page).post(records::login),
         )
         .route("/records/{id}", get(records::show))
+        .route("/records/{id}/journal", get(records::journal))
         .route(
             "/records/{id}/media/{participant}/{kind}",
             get(records::media),
