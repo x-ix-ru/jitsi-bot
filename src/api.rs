@@ -301,6 +301,10 @@ async fn leave(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<SessionInfo>> {
     authorized(&headers, &state)?;
+    Ok(Json(stop_session(&state, id).await?))
+}
+
+async fn stop_session(state: &AppState, id: Uuid) -> ApiResult<SessionInfo> {
     let mut sessions = state.sessions.lock().await;
     let entry = sessions
         .get_mut(&id)
@@ -309,7 +313,7 @@ async fn leave(
         entry.info.status = "stopping";
         let _ = stop.send(());
     }
-    Ok(Json(entry.info.clone()))
+    Ok(entry.info.clone())
 }
 
 async fn read_log<R: tokio::io::AsyncRead + Unpin>(
@@ -448,6 +452,7 @@ pub(crate) async fn serve() -> Result<(), String> {
             get(records::login_page).post(records::login),
         )
         .route("/records/{id}", get(records::show))
+        .route("/records/{id}/leave", post(records::leave_meeting))
         .route("/records/{id}/journal", get(records::journal))
         .route(
             "/records/{id}/media/{participant}/{kind}",
